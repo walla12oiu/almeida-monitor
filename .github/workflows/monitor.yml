@@ -1,0 +1,162 @@
+name: Almeida Ticket Monitor
+
+on:
+  schedule:
+    # Runs every 5 minutes  (GitHub's minimum is 5 mins)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:   # lets you trigger it manually from GitHub too
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repo so we can read/write last_hash.txt
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: pip install requests
+
+      # 4. Run the monitor script
+      - name: Run ticket check
+        env:
+          NOTIFY_EMAIL:    ${{ secrets.NOTIFY_EMAIL }}
+          NOTIFY_PASSWORD: ${{ secrets.NOTIFY_PASSWORD }}
+        run: python check_tickets.py
+
+      # 5. Save updated hash back to the repo so next run can compare
+      - name: Save hash file
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_hash.txt
+          git diff --staged --quiet || git commit -m "chore: update page hash"
+          git push
+
+import hashlib
+import smtplib
+import os
+import json
+import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+
+# ── Config ────────────────────────────────────────────────────────────────────
+URL = "https://almeida.co.uk/calendar/?e=american-psycho-2026"
+RECIPIENT = "peterwallace00001@gmail.com"
+SENDER    = os.environ["NOTIFY_EMAIL"]        # set in GitHub Secrets
+PASSWORD  = os.environ["NOTIFY_PASSWORD"]     # set in GitHub Secrets
+HASH_FILE = "last_hash.txt"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def fetch_page(url: str) -> str:
+    """Fetch the raw HTML of the page."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.text
+
+
+def hash_content(content: str) -> str:
+    """Return an MD5 hash of the page content."""
+    return hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
+def load_last_hash() -> str | None:
+    """Load the previously stored hash (returns None if first run)."""
+    if os.path.exists(HASH_FILE):
+        with open(HASH_FILE, "r") as f:
+            return f.read().strip()
+    return None
+
+
+def save_hash(hash_value: str) -> None:
+    """Save the current hash to file."""
+    with open(HASH_FILE, "w") as f:
+        f.write(hash_value)
+
+
+def send_email(subject: str, body: str) -> None:
+    """Send a notification email via Gmail SMTP."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SENDER
+    msg["To"]      = RECIPIENT
+
+    html_body = f"""
+    <html><body>
+      <h2 style="color:#c0392b;">🎭 Almeida Ticket Alert!</h2>
+      <p>{body}</p>
+      <p><a href="{URL}" style="background:#c0392b;color:white;padding:10px 20px;
+         text-decoration:none;border-radius:4px;">👉 Go to Almeida Calendar</a></p>
+      <hr>
+      <small>Monitored by your GitHub Actions bot · {datetime.now().strftime("%d %b %Y %H:%M UTC")}</small>
+    </body></html>
+    """
+
+    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(SENDER, PASSWORD)
+        server.sendmail(SENDER, RECIPIENT, msg.as_string())
+
+    print(f"✅ Email sent to {RECIPIENT}")
+
+
+def main():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking {URL} ...")
+
+    try:
+        content      = fetch_page(URL)
+        current_hash = hash_content(content)
+        last_hash    = load_last_hash()
+
+        print(f"  Current hash : {current_hash}")
+        print(f"  Last hash    : {last_hash or 'None (first run)'}")
+
+        if last_hash is None:
+            # First ever run — just save the hash, don't alert
+            save_hash(current_hash)
+            print("  First run — baseline saved. No alert sent.")
+
+        elif current_hash != last_hash:
+            print("  ⚠️  CHANGE DETECTED — sending email...")
+            send_email(
+                subject="🎭 Almeida American Psycho — PAGE CHANGED (tickets may be live!)",
+                body=(
+                    "The Almeida American Psycho 2026 calendar page has changed.\n\n"
+                    "This could mean new tickets have gone on sale or dates have been updated.\n\n"
+                    f"Check it now: {URL}"
+                )
+            )
+            save_hash(current_hash)
+
+        else:
+            print("  No change detected.")
+
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        # Optional: email yourself on errors too
+        # send_email("Almeida Monitor — ERROR", str(e))
+        raise
+
+
+if __name__ == "__main__":
+    main()
